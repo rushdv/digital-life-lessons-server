@@ -122,6 +122,16 @@ async function run() {
       next();
     };
 
+    // Premium Verify — accessLevel: "premium" routes এর জন্য
+    const verifyPremium = async (req, res, next) => {
+      const email = req.decoded.email;
+      const user = await usersCollection.findOne({ email });
+      if (!user?.isPremium) {
+        return res.status(403).json({ message: "Premium access required" });
+      }
+      next();
+    };
+
     // ══════════════════════════════════════
     // JWT ROUTE
     // ══════════════════════════════════════
@@ -269,6 +279,16 @@ async function run() {
         .toArray();
 
       res.json({ lessons, total, page: parseInt(page) });
+    });
+
+    // Most saved lessons (for home page) — must be before /lessons/:id
+    app.get("/lessons/most-saved", async (req, res) => {
+      const lessons = await lessonsCollection
+        .find({ visibility: "public", accessLevel: "free" })
+        .sort({ favoritesCount: -1 })
+        .limit(6)
+        .toArray();
+      res.json(lessons);
     });
 
     // Get featured lessons
@@ -554,6 +574,219 @@ async function run() {
       });
 
       res.json({ url: session.url });
+    });
+
+    // ══════════════════════════════════════
+    // SIMILAR / RECOMMENDED LESSONS
+    // ══════════════════════════════════════
+
+    // Similar lessons by category or emotional tone (max 6)
+    app.get("/lessons/:id/similar", async (req, res) => {
+      const lesson = await lessonsCollection.findOne({
+        _id: new ObjectId(req.params.id),
+      });
+      if (!lesson) return res.status(404).json({ message: "Lesson not found" });
+
+      const similar = await lessonsCollection
+        .find({
+          _id: { $ne: new ObjectId(req.params.id) },
+          visibility: "public",
+          $or: [
+            { category: lesson.category },
+            { emotionalTone: lesson.emotionalTone },
+          ],
+        })
+        .limit(6)
+        .toArray();
+
+      res.json(similar);
+    });
+
+    // ══════════════════════════════════════
+    // CREATOR LESSON COUNT (for author card)
+    // ══════════════════════════════════════
+
+    app.get("/users/lesson-count/:email", async (req, res) => {
+      const count = await lessonsCollection.countDocuments({
+        creatorEmail: req.params.email,
+        visibility: "public",
+      });
+      res.json({ count });
+    });
+
+    // ══════════════════════════════════════
+    // ADMIN — DELETE USER (optional)
+    // ══════════════════════════════════════
+
+    app.delete("/users/:id", verifyToken, verifyAdmin, async (req, res) => {
+      const result = await usersCollection.deleteOne({
+        _id: new ObjectId(req.params.id),
+      });
+      res.json(result);
+    });
+
+    // ══════════════════════════════════════
+    // ADMIN — REPORTED LESSONS WITH TITLE
+    // ══════════════════════════════════════
+
+    // Get reported lessons with lesson title joined
+    app.get("/reports/detailed", verifyToken, verifyAdmin, async (req, res) => {
+      const reports = await reportsCollection
+        .aggregate([
+          {
+            $group: {
+              _id: "$lessonId",
+              reportCount: { $sum: 1 },
+              reasons: {
+                $push: {
+                  reason: "$reason",
+                  reporter: "$reporterUserId",
+                  timestamp: "$timestamp",
+                },
+              },
+            },
+          },
+          {
+            $addFields: {
+              lessonObjectId: {
+                $convert: {
+                  input: "$_id",
+                  to: "objectId",
+                  onError: null,
+                },
+              },
+            },
+          },
+          {
+            $lookup: {
+              from: "lessons",
+              localField: "lessonObjectId",
+              foreignField: "_id",
+              as: "lessonInfo",
+            },
+          },
+          {
+            $addFields: {
+              lessonTitle: { $arrayElemAt: ["$lessonInfo.title", 0] },
+              creatorEmail: { $arrayElemAt: ["$lessonInfo.creatorEmail", 0] },
+            },
+          },
+          { $project: { lessonInfo: 0, lessonObjectId: 0 } },
+          { $sort: { reportCount: -1 } },
+        ])
+        .toArray();
+      res.json(reports);
+    });
+
+    // Ignore (delete) a report entry
+    app.delete("/reports/:lessonId", verifyToken, verifyAdmin, async (req, res) => {
+      const result = await reportsCollection.deleteMany({
+        lessonId: req.params.lessonId,
+      });
+      res.json(result);
+    });
+
+    // ══════════════════════════════════════
+    // ADMIN — MANAGE USERS WITH LESSON COUNT
+    // ══════════════════════════════════════
+
+    // Get all users with their lesson count
+    app.get("/admin/users-with-stats", verifyToken, verifyAdmin, async (req, res) => {
+      const users = await usersCollection
+        .find()
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      const usersWithStats = await Promise.all(
+        users.map(async (user) => {
+          const lessonCount = await lessonsCollection.countDocuments({
+            creatorEmail: user.email,
+          });
+          return { ...user, lessonCount };
+        })
+      );
+
+      res.json(usersWithStats);
+    });
+
+    // ══════════════════════════════════════
+    // ADMIN STATS (extended)
+    // ══════════════════════════════════════
+
+    // Override with extended stats
+    app.get("/admin/stats/extended", verifyToken, verifyAdmin, async (req, res) => {
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+
+      const [totalUsers, totalPublicLessons, totalPremiumUsers, reportedLessons, todayLessons] =
+        await Promise.all([
+          usersCollection.countDocuments(),
+          lessonsCollection.countDocuments({ visibility: "public" }),
+          usersCollection.countDocuments({ isPremium: true }),
+          reportsCollection.distinct("lessonId"),
+          lessonsCollection.countDocuments({ createdAt: { $gte: today } }),
+        ]);
+
+      res.json({
+        totalUsers,
+        totalPublicLessons,
+        totalPremiumUsers,
+        totalReported: reportedLessons.length,
+        todayLessons,
+      });
+    });
+
+    // ══════════════════════════════════════
+    // MARK LESSON AS REVIEWED (admin)
+    // ══════════════════════════════════════
+
+    app.patch("/lessons/:id/reviewed", verifyToken, verifyAdmin, async (req, res) => {
+      const result = await lessonsCollection.updateOne(
+        { _id: new ObjectId(req.params.id) },
+        { $set: { isReviewed: true } }
+      );
+      res.json(result);
+    });
+
+    // ══════════════════════════════════════
+    // CHANGE VISIBILITY / ACCESS LEVEL (my-lessons table)
+    // ══════════════════════════════════════
+
+    app.patch("/lessons/:id/visibility", verifyToken, async (req, res) => {
+      const lesson = await lessonsCollection.findOne({
+        _id: new ObjectId(req.params.id),
+      });
+      if (lesson?.creatorEmail !== req.decoded.email) {
+        return res.status(403).json({ message: "Forbidden" });
+      }
+      const result = await lessonsCollection.updateOne(
+        { _id: new ObjectId(req.params.id) },
+        { $set: { visibility: req.body.visibility, updatedAt: new Date() } }
+      );
+      res.json(result);
+    });
+
+    app.patch("/lessons/:id/access-level", verifyToken, async (req, res) => {
+      const email = req.decoded.email;
+      const user = await usersCollection.findOne({ email });
+      const lesson = await lessonsCollection.findOne({
+        _id: new ObjectId(req.params.id),
+      });
+
+      if (lesson?.creatorEmail !== email) {
+        return res.status(403).json({ message: "Forbidden" });
+      }
+
+      // Only premium users can set accessLevel to "premium"
+      if (req.body.accessLevel === "premium" && !user?.isPremium) {
+        return res.status(403).json({ message: "Premium subscription required" });
+      }
+
+      const result = await lessonsCollection.updateOne(
+        { _id: new ObjectId(req.params.id) },
+        { $set: { accessLevel: req.body.accessLevel, updatedAt: new Date() } }
+      );
+      res.json(result);
     });
 
     // ══════════════════════════════════════

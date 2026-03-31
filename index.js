@@ -64,7 +64,7 @@ app.use(express.json());
 // ─────────────────────────────────────────
 // MongoDB Connection
 // ─────────────────────────────────────────
-const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
+const uri = `mongodb+srv://BiteBridgeAdmin:strongpassword@cluster0.yjx8oew.mongodb.net/?appName=Cluster0`;
 
 const client = new MongoClient(uri, {
   serverApi: {

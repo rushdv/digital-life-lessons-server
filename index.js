@@ -248,7 +248,7 @@ async function run() {
       res.json(result);
     });
 
-    // Get public lessons (with filter, sort, search, pagination)
+    // Get public lessons (with filter, sort, search, pagination, accessLevel)
     app.get("/lessons/public", async (req, res) => {
       const {
         category,
@@ -278,7 +278,44 @@ async function run() {
         .limit(parseInt(limit))
         .toArray();
 
-      res.json({ lessons, total, page: parseInt(page) });
+      // Check viewer's premium status to mark locked lessons
+      // Frontend uses isPremiumLocked flag to show blurred card
+      let viewerIsPremium = false;
+      const authHeader = req.headers.authorization;
+      if (authHeader) {
+        try {
+          const token = authHeader.split(" ")[1];
+          const decoded = require("jsonwebtoken").verify(token, process.env.JWT_SECRET);
+          const viewer = await usersCollection.findOne({ email: decoded.email });
+          viewerIsPremium = viewer?.isPremium || false;
+        } catch (_) {
+          // unauthenticated — treat as free user
+        }
+      }
+
+      const result = lessons.map((lesson) => {
+        if (lesson.accessLevel === "premium" && !viewerIsPremium) {
+          // Send minimal info for locked lessons — full content hidden
+          return {
+            _id: lesson._id,
+            title: lesson.title,
+            category: lesson.category,
+            emotionalTone: lesson.emotionalTone,
+            creatorName: lesson.creatorName,
+            creatorPhoto: lesson.creatorPhoto,
+            creatorEmail: lesson.creatorEmail,
+            accessLevel: lesson.accessLevel,
+            visibility: lesson.visibility,
+            likesCount: lesson.likesCount,
+            favoritesCount: lesson.favoritesCount,
+            createdAt: lesson.createdAt,
+            isPremiumLocked: true,
+          };
+        }
+        return { ...lesson, isPremiumLocked: false };
+      });
+
+      res.json({ lessons: result, total, page: parseInt(page) });
     });
 
     // Most saved lessons (for home page) — must be before /lessons/:id
@@ -322,11 +359,32 @@ async function run() {
       res.json(lessons);
     });
 
-    // Get single lesson
+    // Get single lesson — premium lesson access check
     app.get("/lessons/:id", async (req, res) => {
       const lesson = await lessonsCollection.findOne({
         _id: new ObjectId(req.params.id),
       });
+      if (!lesson) return res.status(404).json({ message: "Lesson not found" });
+
+      // If premium lesson, verify viewer is premium or the creator
+      if (lesson.accessLevel === "premium") {
+        const authHeader = req.headers.authorization;
+        if (!authHeader) {
+          return res.status(403).json({ message: "Premium access required", isPremiumLocked: true });
+        }
+        try {
+          const token = authHeader.split(" ")[1];
+          const decoded = require("jsonwebtoken").verify(token, process.env.JWT_SECRET);
+          const viewer = await usersCollection.findOne({ email: decoded.email });
+          const isCreator = lesson.creatorEmail === decoded.email;
+          if (!viewer?.isPremium && !isCreator) {
+            return res.status(403).json({ message: "Premium access required", isPremiumLocked: true });
+          }
+        } catch (_) {
+          return res.status(403).json({ message: "Premium access required", isPremiumLocked: true });
+        }
+      }
+
       res.json(lesson);
     });
 
@@ -465,18 +523,21 @@ async function run() {
       res.json(result);
     });
 
-    // Get my favorites
+    // Get my favorites (with optional category/tone filter)
     app.get("/favorites", verifyToken, async (req, res) => {
+      const { category, tone } = req.query;
+
       const favorites = await favoritesCollection
         .find({ userEmail: req.decoded.email })
         .toArray();
 
       const lessonIds = favorites.map((f) => new ObjectId(f.lessonId));
 
-      const lessons = await lessonsCollection
-        .find({ _id: { $in: lessonIds } })
-        .toArray();
+      const query = { _id: { $in: lessonIds } };
+      if (category) query.category = category;
+      if (tone) query.emotionalTone = tone;
 
+      const lessons = await lessonsCollection.find(query).toArray();
       res.json(lessons);
     });
 
@@ -484,10 +545,24 @@ async function run() {
     // REPORTS ROUTES
     // ══════════════════════════════════════
 
-    // Submit report
+    // Submit report — with reason validation
+    const VALID_REASONS = [
+      "Inappropriate Content",
+      "Hate Speech or Harassment",
+      "Misleading or False Information",
+      "Spam or Promotional Content",
+      "Sensitive or Disturbing Content",
+      "Other",
+    ];
+
     app.post("/reports", verifyToken, async (req, res) => {
+      const { lessonId, reason } = req.body;
+      if (!VALID_REASONS.includes(reason)) {
+        return res.status(400).json({ message: "Invalid report reason" });
+      }
       const report = {
-        ...req.body,
+        lessonId,
+        reason,
         reporterUserId: req.decoded.email,
         timestamp: new Date(),
       };
@@ -518,28 +593,80 @@ async function run() {
     });
 
     // ══════════════════════════════════════
+    // USER DASHBOARD STATS
+    // ══════════════════════════════════════
+
+    // User's own stats — total lessons, total favorites, recent lessons
+    app.get("/dashboard/stats", verifyToken, async (req, res) => {
+      const email = req.decoded.email;
+      const [totalLessons, totalFavorites, recentLessons] = await Promise.all([
+        lessonsCollection.countDocuments({ creatorEmail: email }),
+        favoritesCollection.countDocuments({ userEmail: email }),
+        lessonsCollection
+          .find({ creatorEmail: email })
+          .sort({ createdAt: -1 })
+          .limit(5)
+          .toArray(),
+      ]);
+      res.json({ totalLessons, totalFavorites, recentLessons });
+    });
+
+    // ══════════════════════════════════════
     // ADMIN ROUTES
     // ══════════════════════════════════════
 
     // Admin stats
     app.get("/admin/stats", verifyToken, verifyAdmin, async (req, res) => {
-      const totalUsers = await usersCollection.countDocuments();
-      const totalPublicLessons = await lessonsCollection.countDocuments({
-        visibility: "public",
-      });
-      const reportedLessons = await reportsCollection.distinct("lessonId");
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+
+      const [totalUsers, totalPublicLessons, totalPremiumUsers, reportedLessons, todayLessons] =
+        await Promise.all([
+          usersCollection.countDocuments(),
+          lessonsCollection.countDocuments({ visibility: "public" }),
+          usersCollection.countDocuments({ isPremium: true }),
+          reportsCollection.distinct("lessonId"),
+          lessonsCollection.countDocuments({ createdAt: { $gte: today } }),
+        ]);
+
+      const mostActiveContributors = await lessonsCollection
+        .aggregate([
+          { $match: { visibility: "public" } },
+          {
+            $group: {
+              _id: "$creatorEmail",
+              lessonCount: { $sum: 1 },
+              name: { $first: "$creatorName" },
+              photo: { $first: "$creatorPhoto" },
+            },
+          },
+          { $sort: { lessonCount: -1 } },
+          { $limit: 5 },
+        ])
+        .toArray();
 
       res.json({
         totalUsers,
         totalPublicLessons,
+        totalPremiumUsers,
         totalReported: reportedLessons.length,
+        todayLessons,
+        mostActiveContributors,
       });
     });
 
-    // Get all lessons (admin)
+    // Get all lessons (admin) — with filter support
     app.get("/admin/lessons", verifyToken, verifyAdmin, async (req, res) => {
+      const { category, visibility, flagged } = req.query;
+      const query = {};
+      if (category) query.category = category;
+      if (visibility) query.visibility = visibility;
+      if (flagged === "true") {
+        const reportedIds = await reportsCollection.distinct("lessonId");
+        query._id = { $in: reportedIds.map((id) => { try { return new ObjectId(id); } catch (_) { return null; } }).filter(Boolean) };
+      }
       const lessons = await lessonsCollection
-        .find()
+        .find(query)
         .sort({ createdAt: -1 })
         .toArray();
       res.json(lessons);

@@ -1030,6 +1030,49 @@ async function run() {
       }
     });
 
+
+
+
+
+    // ══════════════════════════════════════
+// STRIPE WEBHOOK
+// ══════════════════════════════════════
+
+app.post("/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  const sig = req.headers["stripe-signature"];
+
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.log("Webhook signature verification failed.", err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === "checkout.session.completed") {
+    const session = event.data.object;
+    const email = session.metadata.email;
+
+    try {
+      await usersCollection.updateOne(
+        { email: email },
+        { $set: { isPremium: true } }
+      );
+
+      console.log(`Premium activated for ${email}`);
+    } catch (err) {
+      console.log("Database update error:", err);
+    }
+  }
+
+  res.json({ received: true });
+});
+
     // ══════════════════════════════════════
     // TEST ROUTE
     // ══════════════════════════════════════

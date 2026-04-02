@@ -17,7 +17,7 @@ app.use(
       if (!origin) return callback(null, true);
       if (origin.startsWith("http://localhost:")) return callback(null, true);
       const allowedOrigins = [
-        "https://digital-life-lessons-client-0.netlify.app/",
+        "https://digital-life-lessons-client-0.netlify.app",
       ];
       if (allowedOrigins.includes(origin)) return callback(null, true);
       return callback(new Error("Not allowed by CORS"));
@@ -27,6 +27,7 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
+
 
 app.options("*", cors());
 

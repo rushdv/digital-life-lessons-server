@@ -17,7 +17,7 @@ app.use(
       if (!origin) return callback(null, true);
       if (origin.startsWith("http://localhost:")) return callback(null, true);
       const allowedOrigins = [
-        "https://your-live-site.netlify.app",
+        "https://digital-life-lessons-client-0.netlify.app/",
       ];
       if (allowedOrigins.includes(origin)) return callback(null, true);
       return callback(new Error("Not allowed by CORS"));
